@@ -1,0 +1,34 @@
+; Lexer, parser, runtime values and the native standard library.
+; Carries no GUI dependency.
+(library
+ (name suchu_core)
+ (public_name suchu.core)
+ (wrapped false)
+ (modules lexical ast parser_utils gui_parser parser runtime native_api suchu_stdlib util)
+ (libraries unix)
+ (flags :standard -w -27-26))
+
+; The evaluator. Deliberately GUI-free so it can also be compiled to JavaScript
+; with js_of_ocaml for the web playground; the desktop GUI is installed at
+; runtime by Gui_backend through Interpreter.gui_hook.
+(library
+ (name suchu_eval)
+ (public_name suchu.eval)
+ (wrapped false)
+ (modules interpreter)
+ (libraries suchu_core)
+ (flags :standard -w -27-26))
+
+; Desktop distribution: the Bogue GUI backend plus the CLI driver.
+(library
+ (name suchu)
+ (public_name suchu)
+ (modules gui_backend cli)
+ (libraries suchu_eval bogue)
+ (flags :standard -w -27-26))
+
+(executable
+ (name suchu_cli)
+ (public_name suchu-cli)
+ (modules suchu_cli)
+ (libraries suchu))
