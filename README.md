@@ -99,8 +99,6 @@ because it ships on a different schedule.
 What lives here:
 
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed, and how to migrate.
-- [`docs/architecture.md`](docs/architecture.md) — the library split and the
-  native extension API.
 - [`examples/`](examples/) — runnable programs, `examples/gui/` for windowed
   ones.
 
@@ -132,7 +130,7 @@ Exit codes: `0` success, `1` usage error, `2` parse error, `3` runtime error.
 | `web/` | js_of_ocaml entry point for the browser playground |
 | `examples/` | Sample programs, `examples/gui/` for windowed ones |
 | `tests/` | Test suite, run with `dune test` |
-| `tools/` | Migration and documentation-checking helpers |
+| `tools/` | `migrate-semicolons.mjs`, the 0.4 → 0.5 source migrator |
 
 The library split matters: `suchu_core` (lexer, parser, runtime) and
 `suchu_eval` (the evaluator) carry no GUI dependency, which is what lets the

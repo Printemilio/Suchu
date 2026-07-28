@@ -1,9 +1,0 @@
-; Web playground engine: the real Suchu evaluator compiled to JavaScript.
-; Depends on suchu_eval, never on suchu, so Bogue/SDL2 stay out of the bundle.
-(executable
- (name suchu_web)
- (modes js)
- (libraries suchu_eval js_of_ocaml)
- (js_of_ocaml
-  (flags --opt 3))
- (flags :standard -w -27-26))
