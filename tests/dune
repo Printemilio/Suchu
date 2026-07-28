@@ -1,0 +1,5 @@
+; The suite exercises the evaluator only, so suchu_eval is enough; suchu stays
+; listed so the desktop GUI backend keeps being built and linked by the tests.
+(test
+ (name test_runner)
+ (libraries suchu_eval suchu))

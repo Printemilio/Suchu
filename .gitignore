@@ -1,0 +1,42 @@
+# --- Build output -----------------------------------------------------------
+# dune's workspace and the scratch projects `suchu build` generates.
+_build/
+build/
+*.install
+*.exe
+*.cmi
+*.cmo
+*.cmx
+*.o
+*.a
+
+# --- Website -----------------------------------------------------------------
+# This repository is the language only. The landing page, the documentation and
+# the browser playground live in their own repository, because they have a
+# different release cadence and a different deployment target.
+#
+# NOTE: the documentation source is therefore NOT backed up by this repository.
+# Keep suchu_website/ under version control somewhere of its own.
+suchu_website/
+
+*.gz
+
+# --- Local state --------------------------------------------------------------
+.backup-pre-refactor/
+node_modules/
+
+# Editor/tooling config, and its dev-server entry points at the website.
+.claude/
+
+# Written by examples/gui/tasks_app.suchu when you run it.
+suchu_tasks.json
+suchu_tasks.txt
+
+# --- Editors and OS ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/

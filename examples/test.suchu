@@ -1,0 +1,166 @@
+// suchu_test_suite.suchu
+// Objectif : tester toutes les features documentées sur le site (suchu_website/docs/).
+// Compatible avec Suchu ≤5.1.1 (sans opérateurs set | &)
+
+print("=== Suchu feature test suite ===");
+
+passed = 0;
+failed = 0;
+
+fun test(name, fn) {
+  print("→", name);
+  ok = true;
+// protection basique contre les plantages
+  result = none;
+  if (fn) {
+    result = fn();
+  }
+  if (result == "ok") {
+    print("   ✔️", name);
+    passed = passed + 1;
+  } else {
+    print("   ❌", name);
+    failed = failed + 1;
+  }
+}
+
+// ---------- BASIC SYNTAX ----------
+test("arithmetics", fun() {
+  a = 5 + 2 * 3 - 1
+  if (a == 10) { return "ok"; } else { return none; }
+})
+
+test("comparison", fun() {
+  if (2 < 3 && 3 >= 3 && !(2 == 3)) { return "ok"; } else { return none; }
+})
+
+test("string concat", fun() {
+  s = "Hello" @ " " @ "Suchu"
+  if (s == "Hello Suchu") { return "ok"; }
+})
+
+test("range inclusive", fun() {
+  r = 1..3
+  if (Length.r == 3) { return "ok"; }
+})
+
+test("conditional expression", fun() {
+  x = if true then 1 else 0
+  if (x == 1) { return "ok"; }
+})
+
+test("while loop", fun() {
+  c = 0
+  while (c < 3) { c = c + 1; }
+  if (c == 3) { return "ok"; }
+})
+
+test("for loop list", fun() {
+  total = 0
+  for (x in [1, 2, 3]) { total = total + x; }
+  if (total == 6) { return "ok"; }
+})
+
+test("match expression", fun() {
+  msg = ""
+  match 2 {
+    case 1 { msg = "a"; }
+    case 2 { msg = "b"; }
+    default { msg = "c"; }
+  }
+  if (msg == "b") { return "ok"; }
+})
+
+// ---------- FUNCTIONS ----------
+test("function + closure", fun() {
+  y = 2
+  fun adder(x) { return x + y; }
+  if (adder(3) == 5) { return "ok"; }
+})
+
+test("higher order map", fun() {
+  fun square(n) { return n * n; }
+  data = [1, 2, 3]
+  result = map(square, data)
+  if (Length.result == 3) { return "ok"; }
+})
+
+test("reduce builtin", fun() {
+  fun add(a, b) { return a + b; }
+  data = [1, 2, 3]
+  total = reduce(add, data, 0)
+  if (total == 6) { return "ok"; }
+})
+
+// ---------- COLLECTIONS ----------
+test("list push/pull/pop", fun() {
+  lst = []
+  push(lst, 1)
+  push(lst, 2)
+  v = pull(lst)
+  if (v == 2 && Length.lst == 1) { return "ok"; }
+})
+
+test("list sort/reverse", fun() {
+  lst = [3, 1, 2]
+  lst.sort()
+  lst.reverse()
+  if (lst.pop() == 1) { return "ok"; }
+})
+
+test("set literal", fun() {
+  s = set {1, 2, 2}
+  if (Length.s == 2) { return "ok"; }
+})
+
+// ---------- BUILTINS ----------
+test("sqrt + pow + abs", fun() {
+  a = sqrt(9)
+  b = Pow(2, 3)
+  c = abs(-5)
+  if (a == 3 && b == 8 && c == 5) { return "ok"; }
+})
+
+test("min max round", fun() {
+  if (min(2, 5) == 2 && max(2, 5) == 5 && round(2.6) == 3) { return "ok"; }
+})
+
+test("type builtin", fun() {
+  if (type(3) == "int" && type("a") == "string") { return "ok"; }
+})
+
+test("Length pseudo-var", fun() {
+  lst = [1, 2, 3]
+  if (Length.lst == 3) { return "ok"; }
+})
+
+// ---------- ERROR HANDLING ----------
+test("assert builtin", fun() {
+  assert(true)
+  return "ok"
+})
+
+// ---------- DYNAMIC EVAL ----------
+test("eval dynamic code", fun() {
+  eval("x = 5 + 5")
+  if (x == 10) { return "ok"; }
+})
+
+// ---------- GUI DSL ----------
+test("GUI minimal window", fun() {
+// Simple GUI test — not run fully, just syntactically parsed
+  window {
+    title: "Smoke";
+    column {
+      label { text: "GUI test"; }
+      button { text: "Ok"; onClick: { print("Clicked"); }; }
+    }
+  }
+  return "ok"
+})
+
+// ---------- SUMMARY ----------
+print("\n=== SUMMARY ===");
+print("Tests passed:", passed);
+print("Tests failed:", failed);
+print("=================");
