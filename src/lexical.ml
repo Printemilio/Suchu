@@ -34,6 +34,8 @@ type token_kind =
   | Float_lit of float
   | String_lit of string
   | Length_lit of int
+  (* A span of time, always normalised to milliseconds: 100ms, 2s. *)
+  | Duration_lit of int
   | Color_lit of string
   | Lparen
   | Rparen
@@ -130,14 +132,28 @@ type state = {
   mutable column : int;
 }
 
+(* Notepad and PowerShell save UTF-8 files with a byte order mark. It carries no
+   meaning here, but the lexer would otherwise report an unreadable "unexpected
+   character" on the very first column of every file written on Windows. *)
+let bom = "\xEF\xBB\xBF"
+
+let starts_with_bom source =
+  String.length source >= 3 && String.sub source 0 3 = bom
+
 let create_state source =
-  { source; length = String.length source; index = 0; line = 1; column = 1 }
+  let index = if starts_with_bom source then 3 else 0 in
+  { source; length = String.length source; index; line = 1; column = 1 }
 
 let peek state =
   if state.index >= state.length then None else Some state.source.[state.index]
 
 let peek_next state =
   if state.index + 1 >= state.length then None else Some state.source.[state.index + 1]
+
+(* Needed to tell a unit from the start of a name: '100s' is a duration,
+   '100start' is not. *)
+let peek_at state offset =
+  if state.index + offset >= state.length then None else Some state.source.[state.index + offset]
 
 let advance state =
   match peek state with
@@ -204,16 +220,25 @@ let read_number state start_line start_column first_digit =
     let value = float_of_string literal in
     token ~kind:(Float_lit value) ~line:start_line ~column:start_column ~lexeme:(Some literal) ()
   else (
+    (* A unit only counts when nothing name-like follows it, so that '100s' is
+       a duration while '100start' still splits into a number and a word. *)
+    let free_at offset =
+      match peek_at state offset with
+      | Some ch when is_alphanum ch || ch = '_' -> false
+      | _ -> true
+    in
+    let value = int_of_string literal in
+    let unit_token kind suffix count =
+      for _ = 1 to count do
+        ignore (advance state)
+      done;
+      token ~kind ~line:start_line ~column:start_column ~lexeme:(Some (literal ^ suffix)) ()
+    in
     match (peek state, peek_next state) with
-    | Some 'p', Some 'x' ->
-        ignore (advance state);
-        ignore (advance state);
-        let value = int_of_string literal in
-        let lexeme = literal ^ "px" in
-        token ~kind:(Length_lit value) ~line:start_line ~column:start_column ~lexeme:(Some lexeme) ()
-    | _ ->
-        let value = int_of_string literal in
-        token ~kind:(Int_lit value) ~line:start_line ~column:start_column ~lexeme:(Some literal) ())
+    | Some 'p', Some 'x' when free_at 2 -> unit_token (Length_lit value) "px" 2
+    | Some 'm', Some 's' when free_at 2 -> unit_token (Duration_lit value) "ms" 2
+    | Some 's', _ when free_at 1 -> unit_token (Duration_lit (value * 1000)) "s" 1
+    | _ -> token ~kind:(Int_lit value) ~line:start_line ~column:start_column ~lexeme:(Some literal) ())
 
 let read_string state start_line start_column =
   let buffer = Buffer.create 32 in

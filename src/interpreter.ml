@@ -40,30 +40,6 @@ let with_scope interp env f =
   Fun.protect ~finally:(fun () -> interp.env <- previous) f
 
 
-let module_alias module_spec =
-  let basename = Filename.basename module_spec in
-  let stem =
-    if Filename.check_suffix basename ".suchu" then Filename.chop_suffix basename ".suchu"
-    else basename
-  in
-  String.map
-    (fun ch ->
-      match ch with
-      | 'a' .. 'z'
-      | 'A' .. 'Z'
-      | '0' .. '9'
-      | '_' -> ch
-      | _ -> '_')
-    stem
-
-let resolve_module_path current_dir module_spec =
-  let with_extension =
-    if Filename.extension module_spec = "" then module_spec ^ ".suchu" else module_spec
-  in
-  if Filename.is_relative with_extension then Filename.concat current_dir with_extension
-  else with_extension
-
-
 let rec run_program interp (program : program) =
   let result = ref V_null in
   List.iter (fun stmt -> result := execute interp stmt) program;
@@ -246,7 +222,7 @@ and evaluate interp = function
   | Identifier name -> env_lookup interp.env name
   | List entries ->
       let values = entries |> List.map (evaluate interp) in
-      V_list (ref values)
+      V_list (list_of_values values)
   | Index (target, index) ->
       let container = evaluate interp target in
       index_get container (evaluate interp index)
@@ -266,6 +242,15 @@ and evaluate interp = function
       evaluate_unary op operand
   | Postfix (op, expr) ->
       evaluate_postfix interp op expr
+  (* && and || have to decide before the right-hand side is touched, which is
+     the whole point of them: 'len(xs) > 0 && xs[0] == 1' must not index an
+     empty list. Every other operator wants both sides first. *)
+  | Binary (left, B_and, right) ->
+      let lv = evaluate interp left in
+      if truthy lv then evaluate interp right else lv
+  | Binary (left, B_or, right) ->
+      let lv = evaluate interp left in
+      if truthy lv then lv else evaluate interp right
   | Binary (left, op, right) ->
       let lv = evaluate interp left in
       let rv = evaluate interp right in
@@ -280,60 +265,28 @@ and evaluate interp = function
   | IfExpr (cond, then_expr, else_expr) ->
       if truthy (evaluate interp cond) then evaluate interp then_expr else evaluate interp else_expr
   | Range (start_expr, end_expr) ->
-      let start = evaluate interp start_expr |> expect_int in
-      let finish = evaluate interp end_expr |> expect_int in
-      let step = if finish >= start then 1 else -1 in
-      let rec build acc current =
-        if step > 0 && current > finish then List.rev acc
-        else if step < 0 && current < finish then List.rev acc
-        else build (current :: acc) (current + step)
-      in
-      V_list (ref (build [] start |> List.map (fun n -> V_int n)))
+      let start = evaluate interp start_expr in
+      let finish = evaluate interp end_expr in
+      range_value start finish
 
 and evaluate_unary op operand =
   match op with
-  | U_neg -> (
-      match operand with
-      | V_int n -> V_int (-n)
-      | V_float f -> V_float (-.f)
-      | _ -> raise (Runtime_error "Unary '-' expects a number"))
+  | U_neg -> negate_operator operand
   | U_pos -> (
       match operand with
       | V_int _
       | V_float _ -> operand
       | _ -> raise (Runtime_error "Unary '+' expects a number"))
   | U_not -> V_bool (not (truthy operand))
-  | U_pull -> (
-      match operand with
-      | V_list items -> (
-          match List.rev !(items) with
-          | [] -> raise (Runtime_error "Cannot pull from empty list")
-          | head :: tail_rev ->
-              items := List.rev tail_rev;
-              head)
-      | _ -> raise (Runtime_error "Prefix '@' expects a list"))
+  | U_pull -> pull_operator operand
 
 and evaluate_postfix interp op expr =
   match expr with
   | Identifier name ->
       let current = env_lookup interp.env name in
-      let next =
-        match (op, current) with
-        | Post_inc, V_int n ->
-            env_assign interp.env name (V_int (n + 1));
-            V_int n
-        | Post_dec, V_int n ->
-            env_assign interp.env name (V_int (n - 1));
-            V_int n
-        | Post_inc, V_float f ->
-            env_assign interp.env name (V_float (f +. 1.0));
-            V_float f
-        | Post_dec, V_float f ->
-            env_assign interp.env name (V_float (f -. 1.0));
-            V_float f
-        | _ -> raise (Runtime_error "Postfix operator expects numeric variable")
-      in
-      next
+      let direction = match op with Post_inc -> 1 | Post_dec -> -1 in
+      env_assign interp.env name (step_value direction current);
+      current
   | _ -> raise (Runtime_error "Postfix operators require an identifier")
 
 and evaluate_binary interp op left right =
@@ -348,151 +301,23 @@ and evaluate_binary interp op left right =
   | B_intersection -> set_intersection left right
   | B_eq -> V_bool (value_equals left right)
   | B_neq -> V_bool (not (value_equals left right))
-  | B_lt -> compare_operator ( < ) left right
-  | B_le -> compare_operator ( <= ) left right
-  | B_gt -> compare_operator ( > ) left right
-  | B_ge -> compare_operator ( >= ) left right
-  | B_and ->
-      if truthy left then right else left
-  | B_or ->
-      if truthy left then left else right
-  | B_at -> (
-      match left with
-      | V_list items ->
-          let _ =
-            match right with
-            | V_list other ->
-                items := !(items) @ !(other);
-                ()
-            | _ -> items := !(items) @ [ right ]
-          in
-          V_list items
-      | V_string text ->
-          V_string (text ^ value_to_string right)
-      | _ -> raise (Runtime_error "'@' operator expects list or string on left"))
+  | B_lt -> compare_operator `Lt left right
+  | B_le -> compare_operator `Le left right
+  | B_gt -> compare_operator `Gt left right
+  | B_ge -> compare_operator `Ge left right
+  (* Unreachable through [evaluate], which decides these before evaluating the
+     right-hand side. Kept so the table stays total, and so a caller that
+     already holds both values still gets the right answer. *)
+  | B_and -> if truthy left then right else left
+  | B_or -> if truthy left then left else right
+  | B_at -> at_operator left right
 
 and evaluate_attribute interp obj name =
-  let expect_no_args method_name args =
-    match args with
-    | [] -> ()
-    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects no arguments" method_name))
-  in
-  let expect_one_arg method_name args =
-    match args with
-    | [ value ] -> value
-    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects one argument" method_name))
-  in
-  let expect_two_args method_name args =
-    match args with
-    | [ a; b ] -> (a, b)
-    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects two arguments" method_name))
-  in
   match obj with
-  | V_module module_env -> env_lookup module_env name
+  (* Length reads a variable by name, so it needs the scope. Everything else is
+     the same lookup the compiler emits. *)
   | V_length -> length_of interp.env name
-  | V_record fields -> (
-      match record_get fields name with
-      | Some value -> value
-      | None -> raise (Runtime_error (Printf.sprintf "Record has no field '%s'" name)))
-  | V_list items -> (
-      match name with
-      | "reverse" ->
-          V_native (fun args ->
-              expect_no_args "reverse" args;
-              items := List.rev !(items);
-              V_list items)
-      | "sort" ->
-          V_native (fun args ->
-              expect_no_args "sort" args;
-              items := List.sort compare_values !(items);
-              V_list items)
-      | "clear" ->
-          V_native (fun args ->
-              expect_no_args "clear" args;
-              items := [];
-              V_list items)
-      | "sum" ->
-          V_native (fun args ->
-              expect_no_args "sum" args;
-              let (int_total, float_total_opt) =
-                List.fold_left
-                  (fun (int_acc, float_opt) value ->
-                    match (value, float_opt) with
-                    | V_int n, None -> (int_acc + n, None)
-                    | V_int n, Some f -> (0, Some (f +. float_of_int n))
-                    | V_float f, None -> (0, Some (float_of_int int_acc +. f))
-                    | V_float f, Some acc -> (0, Some (acc +. f))
-                    | _ -> raise (Runtime_error "sum() expects numeric elements"))
-                  (0, None) !(items)
-              in
-              match float_total_opt with
-              | Some total -> V_float total
-              | None -> V_int int_total)
-      | "pop" ->
-          V_native (fun args ->
-              match args with
-              | [] -> (
-                  match List.rev !(items) with
-                  | [] -> raise (Runtime_error "pop() on empty list")
-                  | head :: tail_rev ->
-                      items := List.rev tail_rev;
-                      head)
-              | [ index ] ->
-                  let idx = expect_int index in
-                  let rec extract i acc remaining =
-                    match remaining with
-                    | [] -> raise (Runtime_error "pop() index out of bounds")
-                    | hd :: tl ->
-                        if i = 0 then
-                          (List.rev acc @ tl, hd)
-                        else
-                          extract (i - 1) (hd :: acc) tl
-                  in
-                  let updated, value = extract idx [] !(items) in
-                  items := updated;
-                  value
-              | _ -> raise (Runtime_error "pop() expects zero or one argument"))
-      | _ -> raise (Runtime_error (Printf.sprintf "Unknown list attribute '%s'" name)))
-  | V_string text -> (
-      match name with
-      | "split" ->
-          V_native (fun args ->
-              let delimiter = expect_string "split" (expect_one_arg "split" args) in
-              let parts = split_string text delimiter |> List.map (fun part -> V_string part) in
-              V_list (ref parts))
-      | "join" ->
-          V_native (fun args ->
-              let list_value = expect_one_arg "join" args in
-              let list_ref = expect_list "join" list_value in
-              let parts =
-                !(list_ref)
-                |> List.map (function V_string s -> s | _ -> raise (Runtime_error "join() expects strings"))
-              in
-              V_string (String.concat text parts))
-      | "replace" ->
-          V_native (fun args ->
-              let old_v, new_v = expect_two_args "replace" args in
-              let old_sub = expect_string "replace" old_v in
-              let new_sub = expect_string "replace" new_v in
-              V_string (replace_substring text old_sub new_sub))
-      | "startswith" ->
-          V_native (fun args ->
-              let prefix = expect_string "startswith" (expect_one_arg "startswith" args) in
-              V_bool (starts_with ~prefix text))
-      | "endswith" ->
-          V_native (fun args ->
-              let suffix = expect_string "endswith" (expect_one_arg "endswith" args) in
-              V_bool (ends_with ~suffix text))
-      | _ -> raise (Runtime_error (Printf.sprintf "Unknown string attribute '%s'" name)))
-  | V_set items -> (
-      match name with
-      | "clear" ->
-          V_native (fun args ->
-              expect_no_args "clear" args;
-              items := [];
-              V_set items)
-      | _ -> raise (Runtime_error (Printf.sprintf "Unknown set attribute '%s'" name)))
-  | _ -> raise (Runtime_error "Unknown attribute access")
+  | other -> attribute_of other name
 
 and call interp callee args =
   match callee with
@@ -506,32 +331,17 @@ and call interp callee args =
       let local_env = child_env fn.env in
       List.iter2 (env_define local_env) fn.params args;
       with_scope interp local_env (fun () ->
+          (* A function yields what it returns, and nothing else. Statements do
+             carry a value -- the REPL prints it, and an assignment gives back
+             what it assigned -- but that value stops at the end of the body: a
+             function that falls off the end yields none. Accumulating it here
+             instead made 'fun f(n) { x = n * 2; }' quietly answer with x. *)
           try
-            (* execute body statements *)
-            let result = ref V_null in
-            List.iter (fun stmt -> result := execute interp stmt) fn.body;
-            !result
+            List.iter (fun stmt -> ignore (execute interp stmt)) fn.body;
+            V_null
           with Return_signal value -> value)
   | _ -> raise (Runtime_error "Attempted to call a non-callable value")
 
-
-and collect_iterable = function
-  | V_list items -> !(items)
-  | V_set items -> !(items)
-  (* Iterating a record yields its field names, in declaration order. *)
-  | V_record fields -> List.map (fun (name, _) -> V_string name) !fields
-  | V_string text ->
-      let chars = List.init (String.length text) (fun i -> V_string (String.make 1 text.[i])) in
-      chars
-  | V_int _
-  | V_float _
-  | V_bool _
-  | V_null
-  | V_native _
-  | V_function _
-  | V_length
-  | V_module _
-  | V_object _ -> raise (Runtime_error "Value is not iterable")
 
 let register_interpreter_builtins interp =
   let define name fn = env_define interp.globals name (V_native fn) in
@@ -539,37 +349,120 @@ let register_interpreter_builtins interp =
     (function
       | [ fn; list_value ] ->
           let list_ref = expect_list "map" list_value in
-          let mapped = !(list_ref) |> List.map (fun item -> call interp fn [ item ]) in
-          V_list (ref mapped)
+          let mapped = list_values list_ref |> List.map (fun item -> call interp fn [ item ]) in
+          V_list (list_of_values mapped)
       | _ -> raise (Runtime_error "map expects (function, list)"));
   define "filter"
     (function
       | [ fn; list_value ] ->
           let list_ref = expect_list "filter" list_value in
           let filtered =
-            !(list_ref)
+            list_values list_ref
             |> List.filter (fun item -> truthy (call interp fn [ item ]))
           in
-          V_list (ref filtered)
+          V_list (list_of_values filtered)
       | _ -> raise (Runtime_error "filter expects (function, list)"));
   define "reduce"
     (function
       | [ fn; list_value ] ->
           let list_ref = expect_list "reduce" list_value in
-          (match !(list_ref) with
+          (match list_values list_ref with
           | [] -> raise (Runtime_error "reduce() of empty list")
           | head :: tail ->
               List.fold_left (fun acc item -> call interp fn [ acc; item ]) head tail)
       | [ fn; list_value; initial ] ->
           let list_ref = expect_list "reduce" list_value in
-          List.fold_left (fun acc item -> call interp fn [ acc; item ]) initial !(list_ref)
+          List.fold_left (fun acc item -> call interp fn [ acc; item ]) initial (list_values list_ref)
       | _ -> raise (Runtime_error "reduce expects (function, list[, initial])"));
+  (* eval() runs a snippet in a room of its own.
+
+     It used to run in the caller's scope, which made it the one place where a
+     compiled program and an interpreted one could not agree: the caller's
+     variables are entries in an environment when interpreted and OCaml refs when
+     compiled, and a snippet can only reach the first. 'eval("n = 99;")' changed n
+     in one and not the other, silently.
+
+     Now it reaches nothing by default. It sees the built-ins that only compute,
+     and whatever the caller chose to hand it. Both sides therefore behave the
+     same for the reason that matters -- there is no ambient anything to differ
+     about -- and eval loses the reputation it earned by having some.
+
+     To let a snippet affect the program, give it a record:
+
+       knobs = { speed: 1.0; };
+       eval("speed = speed * 2;", knobs);
+       knobs.speed                        // 2.0
+
+     A record is one shared mutable value whether the program is interpreted or
+     compiled, so the way back out is the same in both. *)
+  let rec forbids_import statements =
+    List.iter
+      (fun statement ->
+        match statement with
+        | Import _ ->
+            raise
+              (Runtime_error
+                 "eval cannot import: hand the snippet a record of what it may use")
+        | IfStmt (_, a, b) ->
+            forbids_import a;
+            Option.iter forbids_import b
+        | WhileStmt (_, body) | ForStmt (_, _, body) -> forbids_import body
+        | TryStmt (a, _, b) ->
+            forbids_import a;
+            forbids_import b
+        | MatchStmt (_, branches, default_block) ->
+            List.iter (fun (_, block) -> forbids_import block) branches;
+            Option.iter forbids_import default_block
+        | FunctionDef declaration -> forbids_import declaration.body
+        | _ -> ())
+      statements
+  in
+  let evaluate_snippet source exposed =
+    (* A snippet that does not parse is a Suchu error, not a compiler one: the
+       text usually came from whoever is using the program, and a mistyped
+       formula must be catchable rather than fatal. It used to escape 'try'
+       entirely and take the program with it. *)
+    let program =
+      try Parser.parse source with
+      | Parser.Parse_error message | Lexical.Lexing_error message ->
+          raise (Runtime_error ("eval could not read the source: " ^ message))
+    in
+    forbids_import program;
+    let sandbox = empty_env () in
+    List.iter
+      (fun name ->
+        match Hashtbl.find_opt interp.globals.table name with
+        | Some value -> env_define sandbox name value
+        | None -> ())
+      sandbox_builtins;
+    (match exposed with
+    | Some fields -> List.iter (fun (name, value) -> env_define sandbox name value) !fields
+    | None -> ());
+    let result = with_scope interp sandbox (fun () -> run_program interp program) in
+    (* Whatever the snippet did to a name the caller exposed goes back into the
+       record, which is how the caller hears about it. Names the snippet made up
+       are its own and stay behind. *)
+    (match exposed with
+    | Some fields ->
+        List.iter
+          (fun (name, _) ->
+            match Hashtbl.find_opt sandbox.table name with
+            | Some value -> record_set fields name value
+            | None -> ())
+          !fields
+    | None -> ());
+    result
+  in
   define "eval"
     (function
-      | [ V_string source ] ->
-          let program = Parser.parse source in
-          run_program interp program
-      | _ -> raise (Runtime_error "eval expects a source string"))
+      | [ V_string source ] -> evaluate_snippet source None
+      | [ V_string source; V_record fields ] -> evaluate_snippet source (Some fields)
+      | [ V_string _; other ] ->
+          raise
+            (Runtime_error
+               ("eval's second argument is a record of what the snippet may use, got "
+              ^ type_of_value other))
+      | _ -> raise (Runtime_error "eval expects a source string, and optionally a record"))
 
 let create ?(base_dir = Sys.getcwd ()) ?(embedded_modules = []) () =
   Suchu_stdlib.register ();

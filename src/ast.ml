@@ -83,6 +83,11 @@ and gui_literal =
   | GuiBool of bool
   | GuiNumber of float
   | GuiLength of int
+  (* A share of whatever the parent has to give, as written: 50%. Resolved by
+     the backend at layout time, since only then is the parent's size known. *)
+  | GuiPercent of float
+  (* A span of time in milliseconds, however it was written. *)
+  | GuiDuration of int
   | GuiColor of string
   | GuiIdent of string
 

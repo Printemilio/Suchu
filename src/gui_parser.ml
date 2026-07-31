@@ -70,6 +70,7 @@ let gui_literal_of_token token =
   | Int_lit value -> GuiNumber (float_of_int value)
   | Float_lit value -> GuiNumber value
   | Length_lit value -> GuiLength value
+  | Duration_lit value -> GuiDuration value
   | Color_lit value -> GuiColor ("#" ^ value)
   | Ident name -> GuiIdent (lower_string name)
   | Window_kw ->
@@ -87,6 +88,19 @@ let gui_literal_of_token token =
            (Printf.sprintf "Unsupported literal '%s' in GUI property (line %d, column %d)" display
               token.line token.column))
 
+(* '%' is the modulo operator, so it cannot become a unit in the lexer without
+   changing what '50%3' means everywhere else. Instead a percentage is read
+   here, where we already know we are in a GUI property, and only when the '%'
+   sits immediately against the number: '50%' is a width, '50 % 3' is still a
+   remainder. *)
+let percent_follows state token =
+  match token.lexeme with
+  | None -> false
+  | Some lexeme ->
+      let next = peek state in
+      next.kind = Percent && next.line = token.line
+      && next.column = token.column + String.length lexeme
+
 let parse_gui_literal state =
   let token =
     expect state
@@ -97,13 +111,24 @@ let parse_gui_literal state =
         | Int_lit _
         | Float_lit _
         | Length_lit _
+        | Duration_lit _
         | Color_lit _
         | Ident _
         | Window_kw -> true
         | _ -> false)
       "Expected literal value"
   in
-  gui_literal_of_token token
+  match token.kind with
+  | (Int_lit _ | Float_lit _) when percent_follows state token ->
+      ignore (advance state);
+      let value =
+        match token.kind with
+        | Int_lit value -> float_of_int value
+        | Float_lit value -> value
+        | _ -> 0.
+      in
+      GuiPercent value
+  | _ -> gui_literal_of_token token
 
 let token_text token =
   match token.kind with
@@ -111,6 +136,7 @@ let token_text token =
   | Int_lit value -> string_of_int value
   | Float_lit value -> option_default (string_of_float value) token.lexeme
   | Length_lit value -> option_default (string_of_int value ^ "px") token.lexeme
+  | Duration_lit value -> option_default (string_of_int value ^ "ms") token.lexeme
   | Color_lit value -> "#" ^ value
   | Ident _ -> option_default "" token.lexeme
   | True_kw -> "true"
@@ -240,7 +266,8 @@ let parse_event_property state =
 let parse_property_value state name =
   skip_newlines state;
   match String.lowercase_ascii name with
-  | "onclick" | "onhover" | "oninput" -> parse_event_property state
+  | "onclick" | "onhover" | "oninput" | "onchange" | "onpress" | "ontick" | "ondraw" ->
+      parse_event_property state
   | _ -> GuiPropLiteral (parse_gui_literal state)
 
 let parse_property state =

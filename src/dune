@@ -4,7 +4,7 @@
  (name suchu_core)
  (public_name suchu.core)
  (wrapped false)
- (modules lexical ast parser_utils gui_parser parser runtime native_api suchu_stdlib util)
+ (modules lexical ast parser_utils gui_parser parser gui_tree runtime native_api suchu_stdlib transpiler util)
  (libraries unix)
  (flags :standard -w -27-26))
 
@@ -19,12 +19,25 @@
  (libraries suchu_core)
  (flags :standard -w -27-26))
 
-; Desktop distribution: the Bogue GUI backend plus the CLI driver.
+; The typeface, turned into an OCaml module so it travels inside the binary
+; rather than being looked up on the target machine.
+(rule
+ (targets fonts_data.ml)
+ (deps
+  (:generator %{exe:../tools/embed_fonts.exe})
+  (:regular %{project_root}/assets/fonts/LiberationSans-Regular.ttf)
+  (:bold %{project_root}/assets/fonts/LiberationSans-Bold.ttf))
+ (action
+  (with-stdout-to
+   fonts_data.ml
+   (run %{generator} %{regular} %{bold}))))
+
+; Desktop distribution: the raylib GUI backend plus the CLI driver.
 (library
  (name suchu)
  (public_name suchu)
- (modules gui_backend cli)
- (libraries suchu_eval bogue)
+ (modules gui_backend cli fonts_data)
+ (libraries suchu_eval raylib ctypes)
  (flags :standard -w -27-26))
 
 (executable

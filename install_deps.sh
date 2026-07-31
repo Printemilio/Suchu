@@ -33,9 +33,15 @@ install_with_apt() {
     pkg-config
     opam
     bubblewrap
-    libsdl2-dev
-    libsdl2-image-dev
-    libsdl2-ttf-dev
+    libasound2-dev
+    libx11-dev
+    libxrandr-dev
+    libxi-dev
+    libgl1-mesa-dev
+    libglu1-mesa-dev
+    libxcursor-dev
+    libxinerama-dev
+    libxkbcommon-dev
   )
 
   log "Installation des dépendances système via apt-get..."
@@ -53,9 +59,15 @@ install_with_pacman() {
     pkgconf
     opam
     bubblewrap
-    sdl2
-    sdl2_image
-    sdl2_ttf
+    alsa-lib
+    libx11
+    libxrandr
+    libxi
+    mesa
+    glu
+    libxcursor
+    libxinerama
+    libxkbcommon
   )
 
   log "Installation des dépendances système via pacman..."
@@ -65,7 +77,7 @@ install_with_pacman() {
 install_with_brew() {
   log "Installation des dépendances système via Homebrew..."
   brew update
-  brew install opam ocaml dune pkg-config sdl2 sdl2_image sdl2_ttf
+  brew install opam ocaml dune pkg-config
 }
 
 ensure_opam_ready() {
@@ -95,9 +107,9 @@ setup_ocaml_toolchain() {
 
   eval "$(opam env --switch "${switch_name}" --set-switch)"
   opam update -y
-  opam install -y dune bogue
+  opam install -y dune raylib ctypes
 
-  log "La toolchain OCaml/Dune/Bogue est prête dans le switch « ${switch_name} »."
+  log "La toolchain OCaml/Dune/raylib est prête dans le switch « ${switch_name} »."
   log "Pour l'activer dans votre shell courant :"
   printf '  eval "$(opam env --switch %s)"\n' "${switch_name}"
 }
@@ -111,7 +123,7 @@ main() {
   elif command -v brew >/dev/null 2>&1; then
     install_with_brew
   else
-    err "Gestionnaire de paquets non supporté. Installez OCaml, opam, dune et les bibliothèques SDL2 manuellement."
+    err "Gestionnaire de paquets non supporté. Installez OCaml, opam, dune et les en-têtes X11/OpenGL/ALSA manuellement."
     exit 1
   fi
 

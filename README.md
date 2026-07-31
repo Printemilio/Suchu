@@ -39,16 +39,17 @@ in its own repository.
 ## Install
 
 Requires OCaml 5.1+, [dune](https://dune.build/) and the
-[Bogue](https://github.com/sanette/bogue) bindings.
+[raylib](https://github.com/tjammer/raylib-ocaml) bindings. The window is
+drawn with OpenGL 3.3, which any driver from the last decade provides.
 
 ```bash
-opam install dune bogue
+opam install dune raylib
 dune build
 ./install.sh                     # PREFIX=/custom/path to override
 ```
 
 The native build target is Linux and WSL. A Windows `.exe` target needs a
-Windows OCaml and Bogue toolchain, which is maintained separately.
+Windows OCaml and raylib toolchain, which is maintained separately.
 
 ## The language in one page
 
@@ -99,6 +100,8 @@ because it ships on a different schedule.
 What lives here:
 
 - [`CHANGELOG.md`](CHANGELOG.md) — what changed, and how to migrate.
+- [`docs/gui-reference.md`](docs/gui-reference.md) — every GUI element, event,
+  property and built-in on one page.
 - [`examples/`](examples/) — runnable programs, `examples/gui/` for windowed
   ones.
 
@@ -125,7 +128,10 @@ Exit codes: `0` success, `1` usage error, `2` parse error, `3` runtime error.
 | `src/parser.ml`, `src/gui_parser.ml` | Recursive-descent parser, including the GUI grammar |
 | `src/runtime.ml` | Values, environments, built-ins |
 | `src/interpreter.ml` | The evaluator — deliberately free of any GUI dependency |
-| `src/gui_backend.ml` | Bogue backend, installed into the evaluator at startup |
+| `src/gui_tree.ml` | The GUI tree and its style properties, backend-neutral |
+| `src/gui_backend.ml` | raylib backend, installed into the evaluator at startup |
+| `assets/fonts/` | The typeface embedded in every binary, and its licence |
+| `tools/embed_fonts.ml` | Turns those `.ttf` files into an OCaml module at build time |
 | `src/cli.ml` | CLI driver |
 | `web/` | js_of_ocaml entry point for the browser playground |
 | `examples/` | Sample programs, `examples/gui/` for windowed ones |

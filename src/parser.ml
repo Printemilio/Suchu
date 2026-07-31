@@ -629,14 +629,13 @@ and primary state =
       in
       fail state message
 
-and parse_condition state =
-  match peek state with
-  | { kind = Lparen; _ } ->
-      ignore (advance state);
-      let expr = expression state in
-      ignore (expect_specific state Rparen "Expected ')' after condition");
-      expr
-  | _ -> expression state
+(* A condition is an ordinary expression. It used to be special-cased when it
+   began with '(': the parenthesised group was taken and the condition declared
+   finished, which made 'if (a + b) % 2 == 0' impossible to write -- the '%' came
+   as a surprise. Nothing needed the special case. '{' cannot continue an
+   expression, so the expression parser stops before the block on its own, and
+   'if (ready) { ... }' still reads exactly as it did. *)
+and parse_condition state = expression state
 
 (* Since 0.5 every statement ends with ';'. Statements that end in a block
    (if / while / for / fun / match / window) never reach this function, exactly

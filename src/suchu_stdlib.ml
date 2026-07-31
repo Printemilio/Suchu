@@ -34,7 +34,7 @@ let rec json_encode = function
       else raise (Runtime_error "json.encode cannot encode NaN or infinity")
   | V_string value -> "\"" ^ json_escape value ^ "\""
   | V_list values ->
-      "[" ^ String.concat "," (List.map json_encode !values) ^ "]"
+      "[" ^ String.concat "," (List.map json_encode (list_values values)) ^ "]"
   | V_set values ->
       "[" ^ String.concat "," (List.map json_encode !values) ^ "]"
   | V_record fields ->
@@ -199,7 +199,7 @@ and json_array state =
   if state.position < String.length state.source && state.source.[state.position] = ']'
   then (
     state.position <- state.position + 1;
-    V_list (ref []))
+    V_list (empty_list ()))
   else
     let rec items acc =
       let value = json_value state in
@@ -212,7 +212,7 @@ and json_array state =
           items (value :: acc)
       | ']' ->
           state.position <- state.position + 1;
-          V_list (ref (List.rev (value :: acc)))
+          V_list (list_of_values (List.rev (value :: acc)))
       | _ -> json_error state "expected ',' or ']'"
     in
     items []

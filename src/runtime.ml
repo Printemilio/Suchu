@@ -11,7 +11,16 @@ type value =
   | V_float of float
   | V_bool of bool
   | V_string of string
-  | V_list of value list ref
+  (* A growable array rather than an OCaml list.
+
+     It used to be a 'value list ref', and appending meant '!items @ [value]',
+     which copies the whole list. Building a list of n elements cost n squared
+     copies: eighty thousand pushes took a minute. Now a push writes one slot and
+     doubles the storage when it runs out, so building n elements costs n.
+
+     A set keeps the list, since it is small by nature and every operation on it
+     already walks the whole thing to keep the elements unique. *)
+  | V_list of list_buffer
   | V_set of value list ref
   (* An association list rather than a hashtable so fields keep insertion
      order: printing and JSON round-trips stay predictable, and records are
@@ -22,6 +31,15 @@ type value =
   | V_module of environment
   | V_object of native_object
   | V_length
+
+(* [slots] is longer than the list; only the first [count] entries are the
+   list's, and the rest is room to grow. The record is the list's identity, so
+   two names bound to one list see each other's changes exactly as they did when
+   this was a ref. *)
+and list_buffer = {
+  mutable slots : value array;
+  mutable count : int;
+}
 
 and function_value = {
   params : string list;
@@ -37,6 +55,65 @@ and environment = {
 }
 
 exception Runtime_error of string
+
+(* --- lists ----------------------------------------------------------------
+
+   [list_values] and [list_assign] are the shape the rest of the code already
+   spoke when a list was a ref, so most of it reads the same. They cost a walk,
+   which is fine: every caller of them was walking the list anyway. What matters
+   is that appending, indexing and counting no longer do. *)
+
+let list_of_values values =
+  let slots = Array.of_list values in
+  { slots; count = Array.length slots }
+
+let empty_list () = { slots = [||]; count = 0 }
+let list_length buffer = buffer.count
+let list_values buffer = Array.to_list (Array.sub buffer.slots 0 buffer.count)
+
+let list_assign buffer values =
+  let slots = Array.of_list values in
+  buffer.slots <- slots;
+  buffer.count <- Array.length slots
+
+(* Doubling, so n appends cost n moves in total rather than n squared. *)
+let list_reserve buffer wanted =
+  if wanted > Array.length buffer.slots then begin
+    let capacity = max 8 (max wanted (2 * Array.length buffer.slots)) in
+    let slots = Array.make capacity V_null in
+    Array.blit buffer.slots 0 slots 0 buffer.count;
+    buffer.slots <- slots
+  end
+
+let list_push buffer value =
+  list_reserve buffer (buffer.count + 1);
+  buffer.slots.(buffer.count) <- value;
+  buffer.count <- buffer.count + 1
+
+let list_get buffer index = buffer.slots.(index)
+let list_set buffer index value = buffer.slots.(index) <- value
+
+(* The last element off the end. The slot is cleared rather than left holding the
+   value, so a list that has been emptied does not keep it alive. *)
+let list_pop_last buffer =
+  if buffer.count = 0 then None
+  else begin
+    let value = buffer.slots.(buffer.count - 1) in
+    buffer.slots.(buffer.count - 1) <- V_null;
+    buffer.count <- buffer.count - 1;
+    Some value
+  end
+
+let list_append_buffer buffer other =
+  let addition = Array.sub other.slots 0 other.count in
+  list_reserve buffer (buffer.count + Array.length addition);
+  Array.blit addition 0 buffer.slots buffer.count (Array.length addition);
+  buffer.count <- buffer.count + Array.length addition
+
+let list_iter f buffer =
+  for index = 0 to buffer.count - 1 do
+    f buffer.slots.(index)
+  done
 
 let empty_env () = { table = Hashtbl.create 32; parent = None }
 
@@ -99,13 +176,22 @@ let rec value_to_string = function
   | V_null -> "none"
   | V_int n -> string_of_int n
   | V_float f ->
-      let s = string_of_float f in
-      if String.contains s '.' then s else s ^ ".0"
+      (* The trailing '.0' exists so 2. reads as 2.0. Infinity and NaN have no
+         decimal part to complete, and appending one produced 'inf.0' -- text
+         the language cannot read back, since its literals are inf and NaN. *)
+      if Float.is_nan f then "NaN"
+      else if f = Float.infinity then "inf"
+      else if f = Float.neg_infinity then "-inf"
+      else
+        (* string_of_float always leaves a dot, so the old test for one never
+           fired and every whole float printed as '4.' instead of '4.0'. *)
+        let s = string_of_float f in
+        if String.length s > 0 && s.[String.length s - 1] = '.' then s ^ "0" else s
   | V_bool true -> "true"
   | V_bool false -> "false"
   | V_string s -> s
   | V_list items ->
-      let data = !(items) |> List.map value_to_string |> String.concat ", " in
+      let data = list_values items |> List.map value_to_string |> String.concat ", " in
       "[" ^ data ^ "]"
   | V_set items ->
       let data = !(items) |> List.map value_to_string |> String.concat ", " in
@@ -129,7 +215,7 @@ let truthy = function
   | V_int n -> n <> 0
   | V_float f -> f <> 0.0
   | V_string s -> s <> ""
-  | V_list items -> !(items) <> []
+  | V_list items -> list_length items <> 0
   | V_set items -> !(items) <> []
   | V_record fields -> !fields <> []
   | V_function _ -> true
@@ -172,7 +258,8 @@ let rec value_equals left right =
   | V_float a, V_int b -> a = float_of_int b
   | V_bool a, V_bool b -> a = b
   | V_string a, V_string b -> String.equal a b
-  | V_list a, V_list b -> List.length !(a) = List.length !(b) && List.for_all2 value_equals !(a) !(b)
+  | V_list a, V_list b ->
+      list_length a = list_length b && List.for_all2 value_equals (list_values a) (list_values b)
   | V_set a, V_set b ->
       let left_items = !(a) in
       let right_items = !(b) in
@@ -239,10 +326,10 @@ let plus_operator left right =
   | V_string a, V_string b -> V_string (a ^ b)
   | V_string a, v -> V_string (a ^ value_to_string v)
   | V_list items, V_list other ->
-      items := !(items) @ !(other);
+      list_append_buffer items other;
       V_list items
   | V_list items, v ->
-      items := !(items) @ [ v ];
+      list_push items v;
       V_list items
   | _ ->
       let (a, _), (b, _) = (expect_number left, expect_number right) in
@@ -257,6 +344,14 @@ let minus_operator left right =
       let (a, _), (b, _) = (expect_number left, expect_number right) in
       V_float (a -. b)
 
+(* Prefix '-' is not 'zero minus', which would turn -0.0 into 0.0 and would
+   widen an integer to a float. It lives here so the evaluator and the compiler
+   negate through the same function. *)
+let negate_operator = function
+  | V_int n -> V_int (-n)
+  | V_float f -> V_float (-.f)
+  | _ -> raise (Runtime_error "Unary '-' expects a number")
+
 let multiply_operator left right =
   match (left, right) with
   | V_int a, V_int b -> V_int (a * b)
@@ -268,18 +363,47 @@ let divide_operator left right =
   let (a, _), (b, _) = (expect_number left, expect_number right) in
   V_float (a /. b)
 
+(* '@' concatenates. It lives here rather than in the evaluator's operator
+   table so that the compiler emits a call to the same function instead of a
+   second copy of the rule. *)
+let at_operator left right =
+  match left with
+  | V_list items ->
+      (match right with
+      | V_list other -> list_append_buffer items other
+      | _ -> list_push items right);
+      V_list items
+  | V_string text -> V_string (text ^ value_to_string right)
+  | _ -> raise (Runtime_error "'@' operator expects list or string on left")
+
 let modulo_operator left right =
   match (left, right) with
+  (* 'a mod 0' raises OCaml's Division_by_zero, which escapes as a fatal error
+     no Suchu program can catch and no reader can act on. *)
+  | V_int _, V_int 0 -> raise (Runtime_error "Modulo by zero")
   | V_int a, V_int b -> V_int (a mod b)
   | _ -> raise (Runtime_error "Modulo expects integer operands")
 
 let pow_operator left right =
-  let (a, _), (b, _) = (expect_number left, expect_number right) in
-  V_float (a ** b)
-
-let compare_operator cmp left right =
-  let (a, _), (b, _) = (expect_number left, expect_number right) in
-  V_bool (cmp a b)
+  match (left, right) with
+  (* Two integers give an integer: 2 ** 3 is 8, not 8.0. A negative exponent
+     cannot, and neither can a result past the 63-bit range -- rather than
+     wrap silently into nonsense, those fall back to a float. *)
+  | V_int base, V_int exponent when exponent >= 0 ->
+      let approximate = float_of_int base ** float_of_int exponent in
+      if Float.abs approximate > 4.6e18 then V_float approximate
+      else begin
+        let rec power acc factor remaining =
+          if remaining = 0 then acc
+          else
+            power (if remaining land 1 = 1 then acc * factor else acc) (factor * factor)
+              (remaining asr 1)
+        in
+        V_int (power 1 base exponent)
+      end
+  | _ ->
+      let (a, _), (b, _) = (expect_number left, expect_number right) in
+      V_float (a ** b)
 
 let compare_values left right =
   match (left, right) with
@@ -290,6 +414,28 @@ let compare_values left right =
   | V_string a, V_string b -> String.compare a b
   | V_bool a, V_bool b -> Bool.compare a b
   | _ -> raise (Runtime_error "Values are not comparable")
+
+(* '<' and friends promised string comparison and delivered 'Expected numeric
+   value': they went through expect_number, while compare_values right below
+   already knew how to order strings and booleans. Numbers keep going through
+   floats so that IEEE holds -- every comparison against NaN stays false. *)
+let compare_operator ordering left right =
+  let result =
+    match (left, right) with
+    | (V_int _ | V_float _), (V_int _ | V_float _) ->
+        let (a, _), (b, _) = (expect_number left, expect_number right) in
+        if Float.is_nan a || Float.is_nan b then None else Some (Float.compare a b)
+    | _ -> Some (compare_values left right)
+  in
+  match result with
+  | None -> V_bool false
+  | Some c ->
+      V_bool
+        (match ordering with
+        | `Lt -> c < 0
+        | `Le -> c <= 0
+        | `Gt -> c > 0
+        | `Ge -> c >= 0)
 
 let rec find_substring text pattern start =
   let text_len = String.length text in
@@ -377,9 +523,9 @@ let index_out_of_bounds kind position length =
 let index_get container key =
   match (container, key) with
   | V_list items, V_int position ->
-      let length = List.length !items in
+      let length = list_length items in
       if position < 0 || position >= length then index_out_of_bounds "List" position length
-      else List.nth !items position
+      else list_get items position
   | V_string text, V_int position ->
       let length = String.length text in
       if position < 0 || position >= length then index_out_of_bounds "String" position length
@@ -398,9 +544,9 @@ let index_get container key =
 let index_set container key value =
   match (container, key) with
   | V_list items, V_int position ->
-      let length = List.length !items in
+      let length = list_length items in
       if position < 0 || position >= length then index_out_of_bounds "List" position length
-      else items := List.mapi (fun i old -> if i = position then value else old) !items
+      else list_set items position value
   | V_record fields, V_string name -> record_set fields name value
   | V_record _, other ->
       raise (Runtime_error ("Record keys must be strings, got " ^ type_of_value other))
@@ -411,13 +557,213 @@ let index_set container key value =
   | V_set _, _ -> raise (Runtime_error "Sets are unordered and cannot be indexed")
   | other, _ -> raise (Runtime_error ("Cannot assign into a " ^ type_of_value other))
 
-let length_of env name =
-  match env_lookup env name with
+(* Split from [length_of] so the compiler can use it. 'Length.x' reads a
+   variable by name, which the evaluator does at run time and the compiler
+   already knows at compile time; both end up measuring here. The name is
+   carried only to say which one was not countable. *)
+let length_of_value name = function
   | V_string s -> V_int (String.length s)
-  | V_list items -> V_int (List.length !(items))
-  | V_set items -> V_int (List.length !(items))
+  | V_list items -> V_int (list_length items)
+  | V_set items -> V_int (List.length !items)
   | V_record fields -> V_int (List.length !fields)
   | _ -> raise (Runtime_error (Printf.sprintf "Length.%s is not countable" name))
+
+let length_of env name = length_of_value name (env_lookup env name)
+
+(* 1..5, and 5..1 counting back down. Shared, so the compiler cannot disagree
+   about whether the bound is included -- it is. *)
+let range_value from_value to_value =
+  let start = expect_int from_value and finish = expect_int to_value in
+  let step = if finish >= start then 1 else -1 in
+  let rec build acc current =
+    if step > 0 && current > finish then List.rev acc
+    else if step < 0 && current < finish then List.rev acc
+    else build (current :: acc) (current + step)
+  in
+  V_list (list_of_values (build [] start |> List.map (fun n -> V_int n)))
+
+(* What 'for (x in thing)' walks over. Shared, so a compiled loop cannot end up
+   iterating something the evaluator would refuse, or in a different order. *)
+let collect_iterable = function
+  | V_list items -> list_values items
+  | V_set items -> !items
+  (* Iterating a record yields its field names, in declaration order. *)
+  | V_record fields -> List.map (fun (name, _) -> V_string name) !fields
+  | V_string text -> List.init (String.length text) (fun i -> V_string (String.make 1 text.[i]))
+  | V_int _ | V_float _ | V_bool _ | V_null | V_native _ | V_function _ | V_length | V_module _
+  | V_object _ ->
+      raise (Runtime_error "Value is not iterable")
+
+(* How an import spells the name it binds, and where it looks for the file. Both
+   are needed by the evaluator, which resolves an import while running, and by the
+   compiler, which resolves it while translating -- so they live here rather than
+   in either one. *)
+let module_alias module_spec =
+  let basename = Filename.basename module_spec in
+  let stem =
+    if Filename.check_suffix basename ".suchu" then Filename.chop_suffix basename ".suchu"
+    else basename
+  in
+  String.map
+    (fun ch -> match ch with 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> ch | _ -> '_')
+    stem
+
+let resolve_module_path current_dir module_spec =
+  let with_extension =
+    if Filename.extension module_spec = "" then module_spec ^ ".suchu" else module_spec
+  in
+  if Filename.is_relative with_extension then Filename.concat current_dir with_extension
+  else with_extension
+
+(* Prefix '@' takes the last element off a list and hands it back. Shared, so
+   both sides agree that it is the last and not the first. *)
+let pull_operator = function
+  | V_list items -> (
+      match list_pop_last items with
+      | None -> raise (Runtime_error "Cannot pull from empty list")
+      | Some value -> value)
+  | _ -> raise (Runtime_error "Prefix '@' expects a list")
+
+(* The step taken by '++' and '--'. They yield the value from before the step,
+   which is the caller's business; this only says what the next one is. *)
+let step_value direction = function
+  | V_int n -> V_int (n + direction)
+  | V_float f -> V_float (f +. float_of_int direction)
+  | _ -> raise (Runtime_error "Postfix operator expects numeric variable")
+
+(* Reading a field, and the methods of lists, strings and sets. Moved out of the
+   evaluator for the same reason '@' was: the compiler emits a call to this, so
+   there is one definition of what '.sort()' does rather than two that have to be
+   kept in agreement.
+
+   'Length' does not appear here. It reads a variable by name, which needs a
+   scope, and the evaluator settles it before calling this. *)
+let attribute_of obj name =
+  let expect_no_args method_name args =
+    match args with
+    | [] -> ()
+    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects no arguments" method_name))
+  in
+  let expect_one_arg method_name args =
+    match args with
+    | [ value ] -> value
+    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects one argument" method_name))
+  in
+  let expect_two_args method_name args =
+    match args with
+    | [ a; b ] -> (a, b)
+    | _ -> raise (Runtime_error (Printf.sprintf "%s() expects two arguments" method_name))
+  in
+  match obj with
+  | V_module module_env -> env_lookup module_env name
+  | V_record fields -> (
+      match record_get fields name with
+      | Some value -> value
+      | None -> raise (Runtime_error (Printf.sprintf "Record has no field '%s'" name)))
+  | V_list items -> (
+      match name with
+      | "reverse" ->
+          V_native
+            (fun args ->
+              expect_no_args "reverse" args;
+              list_assign items (List.rev (list_values items));
+              V_list items)
+      | "sort" ->
+          V_native
+            (fun args ->
+              expect_no_args "sort" args;
+              list_assign items (List.sort compare_values (list_values items));
+              V_list items)
+      | "clear" ->
+          V_native
+            (fun args ->
+              expect_no_args "clear" args;
+              list_assign items [];
+              V_list items)
+      | "sum" ->
+          V_native
+            (fun args ->
+              expect_no_args "sum" args;
+              let int_total, float_total_opt =
+                List.fold_left
+                  (fun (int_acc, float_opt) value ->
+                    match (value, float_opt) with
+                    | V_int n, None -> (int_acc + n, None)
+                    | V_int n, Some f -> (0, Some (f +. float_of_int n))
+                    | V_float f, None -> (0, Some (float_of_int int_acc +. f))
+                    | V_float f, Some acc -> (0, Some (acc +. f))
+                    | _ -> raise (Runtime_error "sum() expects numeric elements"))
+                  (0, None) (list_values items)
+              in
+              match float_total_opt with Some total -> V_float total | None -> V_int int_total)
+      | "pop" ->
+          V_native
+            (fun args ->
+              match args with
+              | [] -> (
+                  match list_pop_last items with
+                  | None -> raise (Runtime_error "pop() on empty list")
+                  | Some value -> value)
+              | [ index ] ->
+                  let idx = expect_int index in
+                  let rec extract i acc remaining =
+                    match remaining with
+                    | [] -> raise (Runtime_error "pop() index out of bounds")
+                    | hd :: tl -> if i = 0 then (List.rev acc @ tl, hd) else extract (i - 1) (hd :: acc) tl
+                  in
+                  let updated, value = extract idx [] (list_values items) in
+                  list_assign items updated;
+                  value
+              | _ -> raise (Runtime_error "pop() expects zero or one argument"))
+      | _ -> raise (Runtime_error (Printf.sprintf "Unknown list attribute '%s'" name)))
+  | V_string text -> (
+      match name with
+      | "split" ->
+          V_native
+            (fun args ->
+              let delimiter = expect_string "split" (expect_one_arg "split" args) in
+              let parts = split_string text delimiter |> List.map (fun part -> V_string part) in
+              V_list (list_of_values parts))
+      | "join" ->
+          V_native
+            (fun args ->
+              let list_value = expect_one_arg "join" args in
+              let list_ref = expect_list "join" list_value in
+              let parts =
+                list_values list_ref
+                |> List.map (function
+                     | V_string s -> s
+                     | _ -> raise (Runtime_error "join() expects strings"))
+              in
+              V_string (String.concat text parts))
+      | "replace" ->
+          V_native
+            (fun args ->
+              let old_v, new_v = expect_two_args "replace" args in
+              let old_sub = expect_string "replace" old_v in
+              let new_sub = expect_string "replace" new_v in
+              V_string (replace_substring text old_sub new_sub))
+      | "startswith" ->
+          V_native
+            (fun args ->
+              let prefix = expect_string "startswith" (expect_one_arg "startswith" args) in
+              V_bool (starts_with ~prefix text))
+      | "endswith" ->
+          V_native
+            (fun args ->
+              let suffix = expect_string "endswith" (expect_one_arg "endswith" args) in
+              V_bool (ends_with ~suffix text))
+      | _ -> raise (Runtime_error (Printf.sprintf "Unknown string attribute '%s'" name)))
+  | V_set items -> (
+      match name with
+      | "clear" ->
+          V_native
+            (fun args ->
+              expect_no_args "clear" args;
+              items := [];
+              V_set items)
+      | _ -> raise (Runtime_error (Printf.sprintf "Unknown set attribute '%s'" name)))
+  | _ -> raise (Runtime_error "Unknown attribute access")
 
 let builtin_print args =
   let output = args |> List.map value_to_string |> String.concat " " in
@@ -431,13 +777,19 @@ let builtin_input args =
       print_string (value_to_string prompt);
       flush stdout
   | _ -> raise (Runtime_error "input expects At most one argument"));
-  V_string (read_line ())
+  (* Reaching the end of stdin is an ordinary thing to happen -- a piped script,
+     a closed terminal -- and used to escape as a bare OCaml End_of_file, which
+     is not a message any Suchu program can act on or a reader can understand. *)
+  match read_line () with
+  | line -> V_string line
+  | exception End_of_file ->
+      raise (Runtime_error "input reached the end of stdin with nothing to read")
 
 let builtin_push args =
   match args with
   | [ target; value ] ->
       let items = expect_list "push" target in
-      items := !(items) @ [ value ];
+      list_push items value;
       target
   | _ -> raise (Runtime_error "push expects (list, value)")
 
@@ -445,11 +797,9 @@ let builtin_pull args =
   match args with
   | [ target ] ->
       let items = expect_list "pull" target in
-      (match List.rev !(items) with
-      | [] -> raise (Runtime_error "pull on empty list")
-      | head :: tail_rev ->
-          items := List.rev tail_rev;
-          head)
+      (match list_pop_last items with
+      | None -> raise (Runtime_error "pull on empty list")
+      | Some value -> value)
   | _ -> raise (Runtime_error "pull expects (list)")
 
 let builtin_insert args =
@@ -464,9 +814,9 @@ let builtin_insert args =
           | 0, _ -> (List.rev acc, rest)
           | n, hd :: tl -> split (n - 1) (hd :: acc) tl
         in
-        split idx [] !(items)
+        split idx [] (list_values items)
       in
-      items := before @ (value :: after);
+      list_assign items (before @ (value :: after));
       target
   | _ -> raise (Runtime_error "insert expects (list, index, value)")
 
@@ -480,7 +830,7 @@ let builtin_remove args =
         | hd :: tl ->
             if i = 0 then List.rev acc @ tl else remove (i - 1) (hd :: acc) tl
       in
-      items := remove idx [] !(items);
+      list_assign items (remove idx [] (list_values items));
       target
   | _ -> raise (Runtime_error "remove expects (list, index)")
 
@@ -542,6 +892,22 @@ let builtin_truncate args =
       else V_string (utf8_safe_prefix text (max_length - 3) ^ "...")
   | _ -> raise (Runtime_error "truncate expects (text, max_length)")
 
+(* What a snippet handed to eval() is allowed to see.
+
+   Named one by one, and anything not named is refused. A list of what to forbid
+   would quietly let every built-in added later through, which is the wrong way
+   round for a decision about what untrusted text may do.
+
+   Everything here computes and returns. Nothing here touches a file, reads the
+   keyboard, opens a window or reaches the program that called eval. A snippet
+   that should be able to affect its caller is handed a record to work on -- the
+   caller decides what goes in it. *)
+let sandbox_builtins =
+  [ "len"; "type"; "assert"; "truncate";
+    "sqrt"; "Pow"; "abs"; "min"; "max"; "round"; "range";
+    "sin"; "cos"; "tan"; "asin"; "acos"; "atan"; "atan2"; "log"; "exp"; "floor"; "ceil"; "pi";
+    "push"; "pull"; "insert"; "remove"; "map"; "filter"; "reduce" ]
+
 let create_global_environment () =
   let env = empty_env () in
   env_define env "print" (V_native builtin_print);
@@ -552,6 +918,26 @@ let create_global_environment () =
           let (num, _) = expect_number value in
           V_float (sqrt num)
       | _ -> raise (Runtime_error "sqrt expects one argument")));
+  (* Angles in radians, as everywhere else that has these. Added when the 3D
+     scene arrived: a camera going round something needs them, and so does
+     anything drawn on a curve. *)
+  List.iter
+    (fun (name, fn) ->
+      env_define env name
+        (V_native (function
+          | [ value ] ->
+              let num, _ = expect_number value in
+              V_float (fn num)
+          | _ -> raise (Runtime_error (name ^ " expects one argument")))))
+    [ ("sin", sin); ("cos", cos); ("tan", tan); ("asin", asin); ("acos", acos);
+      ("atan", atan); ("log", log); ("exp", exp); ("floor", Float.floor); ("ceil", Float.ceil) ];
+  env_define env "atan2"
+    (V_native (function
+      | [ y; x ] ->
+          let y, _ = expect_number y and x, _ = expect_number x in
+          V_float (atan2 y x)
+      | _ -> raise (Runtime_error "atan2 expects two arguments")));
+  env_define env "pi" (V_float (4.0 *. atan 1.0));
   env_define env "Pow"
     (V_native (function
       | [ a; b ] -> pow_operator a b
@@ -611,7 +997,7 @@ let create_global_environment () =
             if (step > 0 && current >= stop_i) || (step < 0 && current <= stop_i) then List.rev acc
             else build (current :: acc) (current + step)
           in
-          V_list (ref (build [] start_i |> List.map (fun n -> V_int n)))
+          V_list (list_of_values (build [] start_i |> List.map (fun n -> V_int n)))
       | [ start_v; stop_v; step_v ] ->
           let start_i = expect_int start_v in
           let stop_i = expect_int stop_v in
@@ -622,7 +1008,7 @@ let create_global_environment () =
             if (forward && current >= stop_i) || ((not forward) && current <= stop_i) then List.rev acc
             else build (current :: acc) (current + step_i)
           in
-          V_list (ref (build [] start_i |> List.map (fun n -> V_int n)))
+          V_list (list_of_values (build [] start_i |> List.map (fun n -> V_int n)))
       | _ -> raise (Runtime_error "range expects two or three integer arguments")));
   env_define env "assert"
     (V_native (function
@@ -642,7 +1028,7 @@ let create_global_environment () =
   env_define env "len"
     (V_native (function
       | [ V_string text ] -> V_int (String.length text)
-      | [ V_list items ] -> V_int (List.length !items)
+      | [ V_list items ] -> V_int (list_length items)
       | [ V_set items ] -> V_int (List.length !items)
       | [ V_record fields ] -> V_int (List.length !fields)
       | [ other ] ->

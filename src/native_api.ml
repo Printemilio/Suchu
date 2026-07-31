@@ -8,7 +8,7 @@ let int value = V_int value
 let float value = V_float value
 let bool value = V_bool value
 let string value = V_string value
-let list values = V_list (ref values)
+let list values = V_list (list_of_values values)
 let set values = make_set values
 let native fn = V_native fn
 let object_value kind value = make_object kind value
@@ -43,7 +43,7 @@ let as_string = function
            (Printf.sprintf "Expected string, got %s" (type_of_value value)))
 
 let as_list = function
-  | V_list values -> !values
+  | V_list values -> list_values values
   | value ->
       raise
         (Runtime_error

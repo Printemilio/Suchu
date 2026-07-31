@@ -2,7 +2,7 @@ open Parser
 open Interpreter
 open Runtime
 
-(* Install the Bogue GUI backend into Interpreter's hooks. Done at module
+(* Install the raylib GUI backend into Interpreter's hooks. Done at module
    initialisation rather than inside [main] so that every entry point is
    covered, including run_source/run_file called from generated OCaml stubs. *)
 let () = Gui_backend.register ()
@@ -16,6 +16,45 @@ let read_file path =
 let write_file path content =
   let oc = open_out_bin path in
   Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc content)
+
+(* Copying and deleting used to be 'cp' and 'rm -rf' through the shell, which
+   ties compiling a program to being on a machine that has them -- and on
+   Windows 'cp' refuses to overwrite an executable that was produced a moment
+   ago. Done here instead, it works wherever OCaml does. *)
+let copy_file source destination =
+  let from_channel = open_in_bin source in
+  Fun.protect ~finally:(fun () -> close_in from_channel) (fun () ->
+      (* open_out truncates, so an executable already sitting at the destination
+         is overwritten rather than making the copy fail. *)
+      let to_channel = open_out_bin destination in
+      Fun.protect ~finally:(fun () -> close_out to_channel) (fun () ->
+          let buffer = Bytes.create 65536 in
+          let rec transfer () =
+            let read = input from_channel buffer 0 (Bytes.length buffer) in
+            if read > 0 then begin
+              output to_channel buffer 0 read;
+              transfer ()
+            end
+          in
+          transfer ()))
+
+let rec remove_directory path =
+  if Sys.file_exists path then
+    if Sys.is_directory path then begin
+      Array.iter (fun entry -> remove_directory (Filename.concat path entry)) (Sys.readdir path);
+      try Sys.rmdir path with Sys_error _ -> ()
+    end
+    else try Sys.remove path with Sys_error _ -> ()
+
+(* Whether a command can be found, asked of the system rather than by walking the
+   PATH here -- the rules for what counts as executable differ per platform, and
+   the shell already knows them. *)
+let tool_on_path name =
+  let probe =
+    if Sys.win32 then Printf.sprintf "where %s >NUL 2>NUL" name
+    else Printf.sprintf "command -v %s >/dev/null 2>&1" name
+  in
+  Sys.command probe = 0
 
 let rec find_file_upwards start filename =
   let candidate = Filename.concat start filename in
@@ -170,6 +209,14 @@ let show_source_excerpt source message =
   match error_location message with
   | None -> ()
   | Some (line_number, column) ->
+      (* The lexer skips a leading byte order mark, so the excerpt has to drop it
+         too, or the first line prints a stray glyph and the caret sits three
+         columns to the right of the character it is pointing at. *)
+      let source =
+        if Lexical.starts_with_bom source then
+          String.sub source 3 (String.length source - 3)
+        else source
+      in
       let lines = String.split_on_char '\n' source in
       (match List.nth_opt lines (line_number - 1) with
       | None -> ()
@@ -191,7 +238,7 @@ let report_file_error kind path message =
 
 let repl () =
   let interpreter = ref (create ()) in
-  print_endline "Suchu REPL 0.5 - enter :help for commands.";
+  print_endline "Suchu REPL 0.8 - enter :help for commands.";
   let rec loop () =
     print_string "suchu> ";
     flush stdout;
@@ -245,7 +292,7 @@ let generate_stub source =
     source;
   let escaped = Buffer.contents buffer in
   Printf.sprintf
-    "(* Auto-generated Suchu 0.5 program *)\nlet suchu_source = \"%s\"\n\nlet () =\n  \
+    "(* Auto-generated Suchu 0.8 program *)\nlet suchu_source = \"%s\"\n\nlet () =\n  \
      Suchu.Cli.run_source suchu_source\n"
     escaped
 
@@ -292,8 +339,8 @@ let bundle_modules source_path source =
            match Runtime.find_native_module module_spec with
            | Some _ -> []
            | None ->
-               let real_path = Interpreter.resolve_module_path real_dir module_spec in
-               let virtual_path = Interpreter.resolve_module_path virtual_dir module_spec in
+               let real_path = Runtime.resolve_module_path real_dir module_spec in
+               let virtual_path = Runtime.resolve_module_path virtual_dir module_spec in
                if Hashtbl.mem visited real_path then []
                else if not (Sys.file_exists real_path) then
                  raise
@@ -377,7 +424,7 @@ let build_native source_path output_path =
   write_file (Filename.concat app_dir "main.ml")
     (generate_native_entry source bundled_modules);
   write_file (Filename.concat app_dir "dune")
-    "(executable\n (name main)\n (libraries suchu))\n";
+    "(executable\n (name main)\n (libraries suchu)\n (flags (:standard -w -a)))\n";
   let relative_app_dir =
     Filename.concat "build" (Filename.basename app_dir)
   in
@@ -393,22 +440,102 @@ let build_native source_path output_path =
       (Filename.concat (Filename.concat project_root "_build") "default")
       target
   in
-  let copy_command =
-    Printf.sprintf "cp %s %s" (Filename.quote built_binary) (Filename.quote output_path)
-  in
-  if Sys.command copy_command <> 0 then
-    raise
-      (Runtime_error
-         (Printf.sprintf "Could not copy native executable to %s" output_path));
+  (try copy_file built_binary output_path
+   with Sys_error message ->
+     raise
+       (Runtime_error
+          (Printf.sprintf "Could not copy native executable to %s: %s" output_path message)));
   Printf.printf "[suchu] Native executable: %s\n" output_path;
   Printf.printf "[suchu] Bundled modules: %d\n" (List.length bundled_modules);
-  Printf.printf "[suchu] Target: Linux/WSL (%s)\n%!" Sys.os_type
+  Printf.printf "[suchu] Target: %s\n%!" Sys.os_type
+
+(* --- translating to OCaml -------------------------------------------------
+
+   'build' writes the OCaml a reader can open; 'comp' does the same
+   translation without keeping the file, and hands the result to ocamlopt.
+   Both go through Transpiler, so what you read is what gets compiled. *)
+
+let translate source_path =
+  (* The compiler has to know which modules are native -- 'import json' needs
+     translating differently from 'import "tools.suchu"' -- and it learns that
+     from the same registry the evaluator uses. *)
+  Suchu_stdlib.register ();
+  let source = read_file source_path in
+  let program = parse source in
+  (* Relative imports resolve from the file being translated, as they do when it
+     is interpreted. *)
+  try Transpiler.program ~directory:(Filename.dirname source_path) program with
+  | Transpiler.Unsupported message ->
+      raise
+        (Runtime_error
+           (String.concat "\n"
+              [ message ^ ".";
+                "  Every construct of the language compiles. What is left here is a";
+                "  program the interpreter would not accept either, refused now rather";
+                "  than when it runs." ]))
+
+let build_ocaml source_path output_path =
+  write_file output_path (translate source_path)
+
+(* --- compiling to a native binary ------------------------------------------
+
+   The translated OCaml is handed to ocamlfind, which knows where the Suchu
+   library lives and what it needs linking against. Nothing about this needs the
+   Suchu sources: 'suchu comp' works in any directory once the library is
+   installed in the switch, which is what makes it a tool for shipping a program
+   rather than one for working on the language.
+
+   It used to write a dune file and shell out to dune, which meant dune had to be
+   installed and the command had to run inside the checkout. *)
+
+let compile_native source_path output_path =
+  let ocaml = translate source_path in
+  if not (tool_on_path "ocamlfind") then
+    raise
+      (Runtime_error
+         (String.concat "\n"
+            [ "suchu comp needs 'ocamlfind' on the PATH, and cannot find it.";
+              "  It comes with the opam switch. On Windows:";
+              "    $env:PATH = \"$env:LOCALAPPDATA\\opam\\suchu-win\\bin;\" + $env:PATH";
+              "  Elsewhere:";
+              "    eval $(opam env)";
+              "  'suchu run' and 'suchu build' do not need it." ]));
+  (* The library has to be findable by name. Told plainly here rather than left
+     to ocamlfind's own complaint, which arrives after a page of output. *)
+  let quietly command =
+    Sys.command (if Sys.win32 then command ^ " >NUL 2>NUL" else command ^ " >/dev/null 2>&1")
+  in
+  if quietly "ocamlfind query suchu" <> 0 then
+    raise
+      (Runtime_error
+         (String.concat "\n"
+            [ "suchu comp needs the Suchu library installed in the opam switch.";
+              "  From the Suchu checkout:";
+              "    opam install .";
+              "  'suchu run' and 'suchu build' do not need it." ]));
+  (* A directory of its own, so the .cmi and .cmx ocamlopt leaves behind land
+     somewhere that is swept up rather than beside the user's program. *)
+  let work =
+    Filename.concat (Filename.get_temp_dir_name ())
+      ("suchu-comp-" ^ String.sub (Digest.to_hex (Digest.string source_path)) 0 8)
+  in
+  ensure_directory work;
+  let main = Filename.concat work "main.ml" in
+  write_file main ocaml;
+  let command =
+    Printf.sprintf "ocamlfind ocamlopt -package suchu -linkpkg -w -a -o %s %s"
+      (Filename.quote output_path) (Filename.quote main)
+  in
+  let status = Sys.command command in
+  remove_directory work;
+  if status <> 0 then raise (Runtime_error "Native compilation failed")
 
 let usage () =
   print_endline "Usage:";
   print_endline "  suchu run <file.suchu>";
-  print_endline "  suchu comp <file.suchu> <output.ml>";
-  print_endline "  suchu build <file.suchu> [-o output]";
+  print_endline "  suchu build <file.suchu> [-o output.ml]   translate to OCaml";
+  print_endline "  suchu comp <file.suchu> [-o output]        compile to a native binary";
+  print_endline "  suchu comp --bundle <file.suchu> [-o output]  ship the interpreter instead";
   print_endline "  suchu repl";
   print_endline "  suchu update [--root PATH] [--skip-deps] [install.sh options]"
 
@@ -428,35 +555,62 @@ let main argv =
       | Parser.Parse_error msg ->
           report_file_error "Parse error" source msg;
           2)
-  | _ :: "comp" :: source :: output :: [] -> (
-      try
-        compile_to_stub source output;
-        Printf.printf "[suchu] OCaml stub generated At %s\n" output;
-        0
-      with
-      | Runtime_error msg ->
-          prerr_endline ("Runtime error: " ^ msg);
-          3
-      | Lexical.Lexing_error msg ->
-          report_file_error "Lexing error" source msg;
-          2
-      | Parser.Parse_error msg ->
-          report_file_error "Parse error" source msg;
-          2)
+  | _ :: "comp" :: rest -> (
+      let bundled, arguments =
+        match rest with
+        | "--bundle" :: tail -> (true, tail)
+        | tail -> (false, tail)
+      in
+      match arguments with
+      | [] ->
+          prerr_endline "Usage: suchu comp [--bundle] <file.suchu> [-o output]";
+          1
+      | source :: tail -> (
+          let output =
+            match tail with
+            | [] -> Filename.remove_extension source
+            | [ "-o"; path ] | [ "--output"; path ] -> path
+            | _ -> ""
+          in
+          if String.equal output "" then (
+            prerr_endline "Usage: suchu comp [--bundle] <file.suchu> [-o output]";
+            1)
+          else
+            try
+              if bundled then begin
+                build_native source output;
+                Printf.printf "[suchu] Interpreter bundled with the program: %s\n" output
+              end
+              else begin
+                compile_native source output;
+                Printf.printf "[suchu] Compiled to native code: %s\n" output
+              end;
+              0
+            with
+            | Runtime_error msg ->
+                prerr_endline ("Compile error: " ^ msg);
+                3
+            | Lexical.Lexing_error msg ->
+                report_file_error "Lexing error" source msg;
+                2
+            | Parser.Parse_error msg ->
+                report_file_error "Parse error" source msg;
+                2))
   | _ :: "build" :: source :: rest -> (
       let output =
         match rest with
-        | [] -> Filename.remove_extension source
+        | [] -> Filename.remove_extension source ^ ".ml"
         | [ "-o"; path ]
         | [ "--output"; path ] -> path
         | _ ->
-            prerr_endline "Usage: suchu build <file.suchu> [-o output]";
+            prerr_endline "Usage: suchu build <file.suchu> [-o output.ml]";
             ""
       in
       if String.equal output "" then 1
       else
         try
-          build_native source output;
+          build_ocaml source output;
+          Printf.printf "[suchu] OCaml written to %s\n" output;
           0
         with
         | Runtime_error msg ->

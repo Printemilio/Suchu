@@ -1,6 +1,6 @@
 opam-version: "2.0"
 name: "suchu"
-version: "0.5"
+version: "0.8"
 maintainer: "printemilio"
 authors: ["printemilio"]
 license: "MIT"
@@ -10,7 +10,8 @@ build: [
 depends: [
   "ocaml" {>= "5.1"}
   "dune" {>= "3.0"}
-  "bogue"
+  "raylib"
+  "ctypes"
   "tsdl"
   "tsdl-image"
   "tsdl-ttf"
